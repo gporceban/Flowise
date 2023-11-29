@@ -17,7 +17,6 @@ import {
     IReactFlowNode,
     IReactFlowObject,
     INodeData,
-    IDatabaseExport,
     ICredentialReturnResponse,
     chatType,
     IChatMessage,
@@ -31,18 +30,11 @@ import {
     constructGraphs,
     resolveVariables,
     isStartNodeDependOnInput,
-    getAPIKeys,
-    addAPIKey,
-    updateAPIKey,
-    deleteAPIKey,
-    compareKeys,
     mapMimeTypeToInputField,
     findAvailableConfigs,
     isSameOverrideConfig,
-    replaceAllAPIKeys,
     isFlowValidForStream,
     databaseEntities,
-    getApiKey,
     transformToCredentialEntity,
     decryptCredentialData,
     clearAllSessionMemory,
@@ -64,6 +56,7 @@ import { ChatflowPool } from './ChatflowPool'
 import { CachePool } from './CachePool'
 import { ICommonObject, INodeOptionsValue } from 'flowise-components'
 import { createRateLimiter, getRateLimiter, initializeRateLimiter } from './utils/rateLimit'
+import { addAPIKey, compareKeys, deleteAPIKey, getApiKey, getAPIKeys, updateAPIKey } from './utils/apiKey'
 
 export class App {
     app: express.Application
@@ -135,9 +128,11 @@ export class App {
                 '/api/v1/chatflows/apikey/',
                 '/api/v1/public-chatflows',
                 '/api/v1/prediction/',
+                '/api/v1/vector/upsert/',
                 '/api/v1/node-icon/',
                 '/api/v1/components-credentials-icon/',
                 '/api/v1/chatflows-streaming',
+                '/api/v1/openai-assistants-file',
                 '/api/v1/ip'
             ]
             this.app.use((req, res, next) => {
@@ -355,8 +350,12 @@ export class App {
             this.AppDataSource.getRepository(ChatFlow).merge(chatflow, updateChatFlow)
             const result = await this.AppDataSource.getRepository(ChatFlow).save(chatflow)
 
-            // Update chatflowpool inSync to false, to build Langchain again because data has been changed
-            this.chatflowPool.updateInSync(chatflow.id, false)
+            // chatFlowPool is initialized only when a flow is opened
+            // if the user attempts to rename/update category without opening any flow, chatFlowPool will be undefined
+            if (this.chatflowPool) {
+                // Update chatflowpool inSync to false, to build Langchain again because data has been changed
+                this.chatflowPool.updateInSync(chatflow.id, false)
+            }
 
             return res.json(result)
         })
@@ -782,8 +781,8 @@ export class App {
 
                     await openai.beta.assistants.update(assistantDetails.id, {
                         name: assistantDetails.name,
-                        description: assistantDetails.description,
-                        instructions: assistantDetails.instructions,
+                        description: assistantDetails.description ?? '',
+                        instructions: assistantDetails.instructions ?? '',
                         model: assistantDetails.model,
                         tools: filteredTools,
                         file_ids: uniqWith(
@@ -952,13 +951,21 @@ export class App {
 
                 const results = await this.AppDataSource.getRepository(Assistant).delete({ id: req.params.id })
 
-                await openai.beta.assistants.del(assistantDetails.id)
+                if (req.query.isDeleteBoth) await openai.beta.assistants.del(assistantDetails.id)
 
                 return res.json(results)
             } catch (error: any) {
                 if (error.status === 404 && error.type === 'invalid_request_error') return res.send('OK')
                 return res.status(500).send(`Error deleting assistant: ${error}`)
             }
+        })
+
+        // Download file from assistant
+        this.app.post('/api/v1/openai-assistants-file', async (req: Request, res: Response) => {
+            const filePath = path.join(getUserHome(), '.flowise', 'openai-assistant', req.body.fileName)
+            res.setHeader('Content-Disposition', 'attachment; filename=' + path.basename(filePath))
+            const fileStream = fs.createReadStream(filePath)
+            fileStream.pipe(res)
         })
 
         // ----------------------------------------
@@ -1012,54 +1019,20 @@ export class App {
         })
 
         // ----------------------------------------
-        // Export Load Chatflow & ChatMessage & Apikeys
+        // Upsert
         // ----------------------------------------
 
-        this.app.get('/api/v1/database/export', async (req: Request, res: Response) => {
-            const chatmessages = await this.AppDataSource.getRepository(ChatMessage).find()
-            const chatflows = await this.AppDataSource.getRepository(ChatFlow).find()
-            const apikeys = await getAPIKeys()
-            const result: IDatabaseExport = {
-                chatmessages,
-                chatflows,
-                apikeys
+        this.app.post(
+            '/api/v1/vector/upsert/:id',
+            upload.array('files'),
+            (req: Request, res: Response, next: NextFunction) => getRateLimiter(req, res, next),
+            async (req: Request, res: Response) => {
+                await this.buildChatflow(req, res, undefined, false, true)
             }
-            return res.json(result)
-        })
+        )
 
-        this.app.post('/api/v1/database/load', async (req: Request, res: Response) => {
-            const databaseItems: IDatabaseExport = req.body
-
-            await this.AppDataSource.getRepository(ChatFlow).delete({})
-            await this.AppDataSource.getRepository(ChatMessage).delete({})
-
-            let error = ''
-
-            // Get a new query runner instance
-            const queryRunner = this.AppDataSource.createQueryRunner()
-
-            // Start a new transaction
-            await queryRunner.startTransaction()
-
-            try {
-                const chatflows: ChatFlow[] = databaseItems.chatflows
-                const chatmessages: ChatMessage[] = databaseItems.chatmessages
-
-                await queryRunner.manager.insert(ChatFlow, chatflows)
-                await queryRunner.manager.insert(ChatMessage, chatmessages)
-
-                await queryRunner.commitTransaction()
-            } catch (err: any) {
-                error = err?.message ?? 'Error loading database'
-                await queryRunner.rollbackTransaction()
-            } finally {
-                await queryRunner.release()
-            }
-
-            await replaceAllAPIKeys(databaseItems.apikeys)
-
-            if (error) return res.status(500).send(error)
-            return res.status(201).send('OK')
+        this.app.post('/api/v1/vector/internal-upsert/:id', async (req: Request, res: Response) => {
+            await this.buildChatflow(req, res, undefined, true, true)
         })
 
         // ----------------------------------------
@@ -1072,13 +1045,13 @@ export class App {
             upload.array('files'),
             (req: Request, res: Response, next: NextFunction) => getRateLimiter(req, res, next),
             async (req: Request, res: Response) => {
-                await this.processPrediction(req, res, socketIO)
+                await this.buildChatflow(req, res, socketIO)
             }
         )
 
         // Send input message and get prediction result (Internal)
         this.app.post('/api/v1/internal-prediction/:id', async (req: Request, res: Response) => {
-            await this.processPrediction(req, res, socketIO, true)
+            await this.buildChatflow(req, res, socketIO, true)
         })
 
         // ----------------------------------------
@@ -1135,28 +1108,52 @@ export class App {
         // API Keys
         // ----------------------------------------
 
+        const addChatflowsCount = async (keys: any, res: Response) => {
+            if (keys) {
+                const updatedKeys: any[] = []
+                //iterate through keys and get chatflows
+                for (const key of keys) {
+                    const chatflows = await this.AppDataSource.getRepository(ChatFlow)
+                        .createQueryBuilder('cf')
+                        .where('cf.apikeyid = :apikeyid', { apikeyid: key.id })
+                        .getMany()
+                    const linkedChatFlows: any[] = []
+                    chatflows.map((cf) => {
+                        linkedChatFlows.push({
+                            flowName: cf.name,
+                            category: cf.category,
+                            updatedDate: cf.updatedDate
+                        })
+                    })
+                    key.chatFlows = linkedChatFlows
+                    updatedKeys.push(key)
+                }
+                return res.json(updatedKeys)
+            }
+            return res.json(keys)
+        }
         // Get api keys
         this.app.get('/api/v1/apikey', async (req: Request, res: Response) => {
             const keys = await getAPIKeys()
-            return res.json(keys)
+            return addChatflowsCount(keys, res)
         })
 
         // Add new api key
         this.app.post('/api/v1/apikey', async (req: Request, res: Response) => {
             const keys = await addAPIKey(req.body.keyName)
-            return res.json(keys)
+            return addChatflowsCount(keys, res)
         })
 
         // Update api key
         this.app.put('/api/v1/apikey/:id', async (req: Request, res: Response) => {
             const keys = await updateAPIKey(req.params.id, req.body.keyName)
-            return res.json(keys)
+            return addChatflowsCount(keys, res)
         })
 
         // Delete new api key
         this.app.delete('/api/v1/apikey/:id', async (req: Request, res: Response) => {
             const keys = await deleteAPIKey(req.params.id)
-            return res.json(keys)
+            return addChatflowsCount(keys, res)
         })
 
         // Verify api key
@@ -1284,13 +1281,14 @@ export class App {
     }
 
     /**
-     * Process Prediction
+     * Build Chatflow
      * @param {Request} req
      * @param {Response} res
      * @param {Server} socketIO
      * @param {boolean} isInternal
+     * @param {boolean} isUpsert
      */
-    async processPrediction(req: Request, res: Response, socketIO?: Server, isInternal: boolean = false) {
+    async buildChatflow(req: Request, res: Response, socketIO?: Server, isInternal: boolean = false, isUpsert: boolean = false) {
         try {
             const chatflowid = req.params.id
             let incomingInput: IncomingInput = req.body
@@ -1331,7 +1329,8 @@ export class App {
                     question: req.body.question ?? 'hello',
                     overrideConfig,
                     history: [],
-                    socketIOClientId: req.body.socketIOClientId
+                    socketIOClientId: req.body.socketIOClientId,
+                    stopNodeId: req.body.stopNodeId
                 }
             }
 
@@ -1356,7 +1355,8 @@ export class App {
                         this.chatflowPool.activeChatflows[chatflowid].overrideConfig,
                         incomingInput.overrideConfig
                     ) &&
-                    !isStartNodeDependOnInput(this.chatflowPool.activeChatflows[chatflowid].startingNodes, nodes)
+                    !isStartNodeDependOnInput(this.chatflowPool.activeChatflows[chatflowid].startingNodes, nodes) &&
+                    !isUpsert
                 )
             }
 
@@ -1376,14 +1376,15 @@ export class App {
                 const endingNodeData = nodes.find((nd) => nd.id === endingNodeId)?.data
                 if (!endingNodeData) return res.status(500).send(`Ending node ${endingNodeId} data not found`)
 
-                if (endingNodeData && endingNodeData.category !== 'Chains' && endingNodeData.category !== 'Agents') {
+                if (endingNodeData && endingNodeData.category !== 'Chains' && endingNodeData.category !== 'Agents' && !isUpsert) {
                     return res.status(500).send(`Ending node must be either a Chain or Agent`)
                 }
 
                 if (
                     endingNodeData.outputs &&
                     Object.keys(endingNodeData.outputs).length &&
-                    !Object.values(endingNodeData.outputs).includes(endingNodeData.name)
+                    !Object.values(endingNodeData.outputs).includes(endingNodeData.name) &&
+                    !isUpsert
                 ) {
                     return res
                         .status(500)
@@ -1413,8 +1414,11 @@ export class App {
                     chatflowid,
                     this.AppDataSource,
                     incomingInput?.overrideConfig,
-                    this.cachePool
+                    this.cachePool,
+                    isUpsert,
+                    incomingInput.stopNodeId
                 )
+                if (isUpsert) return res.status(201).send('Successfully Upserted')
 
                 const nodeToExecute = reactFlowNodes.find((node: IReactFlowNode) => node.id === endingNodeId)
                 if (!nodeToExecute) return res.status(404).send(`Node ${endingNodeId} not found`)
@@ -1499,6 +1503,7 @@ export class App {
             }
             if (result?.sourceDocuments) apiMessage.sourceDocuments = JSON.stringify(result.sourceDocuments)
             if (result?.usedTools) apiMessage.usedTools = JSON.stringify(result.usedTools)
+            if (result?.fileAnnotations) apiMessage.fileAnnotations = JSON.stringify(result.fileAnnotations)
             await this.addChatMessage(apiMessage)
 
             logger.debug(`[server]: Finished running ${nodeToExecuteData.label} (${nodeToExecuteData.id})`)
